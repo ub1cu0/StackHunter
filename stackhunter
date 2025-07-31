@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+import re
+import sys
+import argparse
+
+# -- Colores ANSI --
+RESET = "\033[0m"
+BOLD = "\033[1m"
+FAINT = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+GRAY = "\033[90m"
+
+def color(txt, clr):
+    return f"{clr}{txt}{RESET}"
+
+# -- Regex para direcciones --
+HEXADDR_RE = re.compile(r'0x[0-9a-fA-F]+')
+
+# -- Pattern para detectar basura del payload --
+FUZZ_ARTIFACTS = ["%p", "p%", "p.p", ".p.", ".p", "p.", "%p.", ".%p", "%p%"]
+
+HELP_INFO = f"""
+{color('StackHunter CLI', BOLD)}
+{color('---------------', FAINT)}
+Run one command at a time:
+
+  {color('-c, --cyclic N', GREEN)}   Output N x "%p." pattern (example: -c 30)
+  {color('-s, --scan LEAK', GREEN)}  Analyze a leak (addresses + values separately)
+                                     Wrap with quotes if the leak contains spaces
+  {color('-f, --find LEAK ... NEEDLE', GREEN)}
+                                     Search for NEEDLE inside LEAK tokens, show position
+  {color('-h, --help', YELLOW)}      Show this help message
+"""
+
+# -- helpers --
+def _info_from_token(token):
+    data = token[2:]
+    width = 8 if len(data) > 8 else 4
+    try:
+        val = int(token, 16)
+    except:
+        val = 0
+    try:
+        little = val.to_bytes(width, 'little')
+        big = val.to_bytes(width, 'big')
+    except OverflowError:
+        width = 8
+        little = val.to_bytes(width, 'little')
+        big = val.to_bytes(width, 'big')
+    return width, val, little, big
+
+def _all_visible(buf):
+    return buf and all(32 <= b <= 126 for b in buf if b != 0)
+
+def looks_like_fuzz(token):
+    width, val, little, big = _info_from_token(token)
+    for b in (little, big):
+        if _all_visible(b):
+            s = b.decode('latin-1').lower()
+            for p in FUZZ_ARTIFACTS:
+                if p in s:
+                    return True
+    return False
+
+def try_ascii(token):
+    width, val, little, big = _info_from_token(token)
+    for name, b in [("little", little), ("big", big)]:
+        if _all_visible(b):
+            return name, b.decode('latin-1')
+    return None
+
+def tag_token(token):
+    t = token.lower()
+    raw = t[2:]
+    width, val, little, big = _info_from_token(token)
+
+    small = (val == 0 or val < 0x1000)
+
+    canary = raw.startswith("00") or raw.endswith("00")
+    libc = (width == 8 and val >= 0x7f0000000000) or (width == 4 and 0xF7000000 <= val <= 0xF8FFFFFF)
+    stack = (width == 8 and val >= 0x7fff00000000) or (width == 4 and (val >= 0xFF000000 or 0xBFFF0000 <= val <= 0xBFFFFFFF))
+    main = (width == 8 and ((val >> 40) & 0xff) in (0x55, 0x56)) or (width == 4 and 0x08040000 <= val <= 0x080FFFFF)
+
+    return {
+        "width": width,
+        "val": val,
+        "small": small,
+        "canary": canary,
+        "libc": libc,
+        "stack": stack,
+        "main": main,
+        "fuzz": looks_like_fuzz(token)
+    }
+
+def get_labels(meta):
+    out = []
+    if meta["canary"]:
+        out.append(color("possible canary", YELLOW))
+    if meta["libc"]:
+        out.append(color("possible libc/ld", MAGENTA))
+    if meta["stack"]:
+        out.append(color("possible stack", BLUE))
+    if meta["main"]:
+        out.append(color("possible main/PIE", GREEN))
+    return out
+
+# -- funciones principales --
+def cmd_cyclic(count, sep="."):
+    if not count or count <= 0:
+        print(color("Give a number > 0", RED))
+        return 1
+    print(("%p" + sep) * count)
+    return 0
+
+def cmd_scan(raw_leak):
+    tokens = HEXADDR_RE.findall(raw_leak)
+    if not tokens:
+        print(color("No addresses found (expecting like 0x12345678)", RED))
+        return 1
+
+    addrs = []
+    extras = []
+
+    for idx, t in enumerate(tokens, 1):
+        meta = tag_token(t)
+        if meta["small"] and not meta["fuzz"]:
+            ascii_guess = try_ascii(t)
+            extras.append({
+                "pos": idx,
+                "tok": t,
+                "dec": meta["val"],
+                "ascii": f'{ascii_guess[0]}: "{ascii_guess[1]}"' if ascii_guess else "not printable"
+            })
+            continue
+        if not meta["small"] and not meta["fuzz"]:
+            addrs.append((idx, t, meta))
+
+    print(color("\n== Addresses ==", BOLD))
+    if not addrs:
+        print(color("Nothing address-like", FAINT))
+    else:
+        for idx, t, meta in addrs:
+            tags = get_labels(meta)
+            extra = " " + color("|", GRAY) + " " + ", ".join(tags) if tags else ""
+            print(f"[{color(idx, CYAN)}] {color(t, BOLD)}{extra} {color('|', GRAY)} {color('%{}$p'.format(idx), GRAY)}")
+
+    print(color("\n== Small Values ==", BOLD))
+    for v in extras:
+        print(f"[{color(v['pos'], CYAN)}] {v['tok']} {color('|', GRAY)} dec: {color(v['dec'], MAGENTA)} {color('|', GRAY)} ascii: {color(v['ascii'], YELLOW)} {color('|', GRAY)} {color('%{}$p'.format(v['pos']), GRAY)}")
+
+    return 0
+
+def cmd_find(data):
+    if len(data) < 2:
+        print(color("Expected: leak then value", RED))
+        return 1
+    needle = data[-1].lower()
+    haystack = " ".join(data[:-1])
+    tokens = HEXADDR_RE.findall(haystack)
+    if not tokens:
+        print(color("No addresses to search in.", RED))
+        return 1
+    print(color("--- Results ---", BOLD))
+    hits = 0
+    for i, t in enumerate(tokens, 1):
+        if needle in t.lower():
+            print(f"[{color(i, CYAN)}] {color(t, BOLD)} {color('|', GRAY)} {color('%{}$p'.format(i), GRAY)}")
+            hits += 1
+    if hits == 0:
+        print(color("No matches.", FAINT))
+    return 0
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-c", "--cyclic", type=int)
+    parser.add_argument("-s", "--scan", nargs="+")
+    parser.add_argument("-f", "--find", nargs="+")
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("--sep", default=".")
+    args, unknown = parser.parse_known_args()
+
+    if args.help or (args.cyclic is None and args.scan is None and args.find is None):
+        print(HELP_INFO)
+        return 0
+    if args.cyclic:
+        return cmd_cyclic(args.cyclic, args.sep)
+    if args.scan:
+        return cmd_scan(" ".join(args.scan))
+    if args.find:
+        return cmd_find(args.find)
+
+    print(color("Nothing to do. Use -h for help.", RED))
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
