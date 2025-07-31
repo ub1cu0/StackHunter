@@ -48,7 +48,8 @@ stackhunter -c 50
 stackhunter -s "0x200.0xf7f275c0.0x804877d.0x1.0xfffffea1"
 ```
 
-<img width="515" height="180" alt="image" src="https://github.com/user-attachments/assets/4d1c8040-963b-476e-8eb7-e9ffccd5a523" />
+<img width="518" height="183" alt="image" src="https://github.com/user-attachments/assets/c6d8e966-8955-4376-9d1f-99a4eea4f37a" />
+
 
 ### Find where a leaked address appears
 
